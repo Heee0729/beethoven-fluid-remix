@@ -342,26 +342,86 @@ export class AudioEngine {
   }
 }
 
-/* Plays a user-uploaded audio file and extracts beat/melody events
-   in real time (spectral-flux onset detection), so the fluid can dance to any song. */
+/* Adaptive per-band statistics: rolling p10/p90 envelope for normalization,
+   z-score onset detection, and a feedback loop that drifts the trigger
+   threshold until the event rate converges to a target — so visual density
+   stays consistent across genres and loudness levels. */
+export class BandStat {
+  constructor(targetRate, refractory) {
+    this.target = targetRate;       // desired events per second
+    this.refractory = refractory;   // min seconds between events
+    this.mu = 0; this.var = 0;      // running mean / variance (onset reference)
+    this.lo = 1; this.hi = 0;       // rolling low/high envelope (normalization)
+    this.k = 2.4;                   // adaptive z-score threshold
+    this.rate = 0;                  // measured events/sec (leaky integrator)
+    this.lastFire = -1;
+    this.norm = 0;                  // current energy normalized to this track
+  }
+
+  /** feed one frame of raw band energy; returns true when an onset fires */
+  update(e, now, dt) {
+    // asymmetric trackers ≈ rolling percentiles of this song's dynamics
+    this.lo += (e < this.lo ? 0.4 : 0.02) * (e - this.lo) * Math.min(1, dt * 60);
+    this.hi += (e > this.hi ? 0.4 : 0.02) * (e - this.hi) * Math.min(1, dt * 60);
+    const span = Math.max(0.02, this.hi - this.lo);
+    this.norm = Math.min(1, Math.max(0, (e - this.lo) / span));
+
+    // ~1.2 s EMA mean/variance → z-score measures "surprise", not loudness
+    const a = 1 - Math.exp(-dt / 1.2);
+    this.mu += a * (e - this.mu);
+    this.var += a * ((e - this.mu) * (e - this.mu) - this.var);
+    const z = (e - this.mu) / (Math.sqrt(this.var) + 0.01);
+
+    // rate feedback: too many events → raise threshold, too few → lower it
+    this.rate *= Math.exp(-dt / 3);
+    this.k = Math.min(6, Math.max(1.2, this.k + (this.rate - this.target) * dt * 0.7));
+
+    // noise gate: must stand out of this song's own floor, plus absolute silence guard
+    const gate = e > this.lo + span * 0.15 && e > 0.03;
+    if (z > this.k && gate && now - this.lastFire > this.refractory) {
+      this.lastFire = now;
+      this.rate += 1 / 3;
+      return true;
+    }
+    return false;
+  }
+}
+
+/* Plays a user-uploaded audio file and extracts beat/melody events in real time,
+   with whole-track gain normalization + adaptive per-band analysis. */
 export class TrackPlayer {
   constructor() {
     this.playing = false;
     this.name = '';
     this.offset = 0;
-    this._hist = { bass: [], mid: [], high: [] };
-    this._last = { kick: 0, snare: 0, note: 0 };
+    this._resetStats();
+  }
+
+  _resetStats() {
+    this.bands = {
+      bass: new BandStat(2.0, 0.2),   // kicks
+      high: new BandStat(2.5, 0.15),  // snares / hats
+      mid: new BandStat(3.0, 0.12),   // melody / vocals
+    };
+    this._norm = { bass: 0, mid: 0, high: 0 };
+    this._lastT = 0;
   }
 
   _build() {
     const ctx = (this.ctx = new (window.AudioContext || window.webkitAudioContext)());
-    this.master = ctx.createGain();
+    this.master = ctx.createGain();          // AGC makeup gain, set per track
     this.master.gain.value = 0.9;
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -8;
+    limiter.knee.value = 4;
+    limiter.ratio.value = 14;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.18;
     this.analyser = ctx.createAnalyser();
     this.analyser.fftSize = 1024;
     this.analyser.smoothingTimeConstant = 0.6;
     this.fft = new Uint8Array(this.analyser.frequencyBinCount);
-    this.master.connect(this.analyser).connect(ctx.destination);
+    this.master.connect(limiter).connect(this.analyser).connect(ctx.destination);
   }
 
   async load(file) {
@@ -371,6 +431,15 @@ export class TrackPlayer {
     this.buffer = await this.ctx.decodeAudioData(data);
     this.name = file.name.replace(/\.[^.]+$/, '');
     this.offset = 0;
+    this._resetStats();
+
+    // whole-track RMS → makeup gain toward a common loudness target,
+    // so quiet acoustic recordings and brick-walled EDM analyze alike
+    const ch = this.buffer.getChannelData(0);
+    let sum = 0, n = 0;
+    for (let i = 0; i < ch.length; i += 64) { sum += ch[i] * ch[i]; n++; }
+    const rms = Math.sqrt(sum / n) || 0.01;
+    this.master.gain.value = Math.min(6, Math.max(0.4, 0.2 / rms));
   }
 
   async start() {
@@ -381,6 +450,7 @@ export class TrackPlayer {
     this.src.loop = true;
     this.src.connect(this.master);
     this.startedAt = this.ctx.currentTime;
+    this._lastT = this.ctx.currentTime;
     this.src.start(0, this.offset % this.buffer.duration);
     this.playing = true;
   }
@@ -392,8 +462,7 @@ export class TrackPlayer {
     this.playing = false;
   }
 
-  energy() {
-    if (!this.analyser) return { bass: 0, mid: 0, high: 0 };
+  _rawEnergy() {
     this.analyser.getByteFrequencyData(this.fft);
     const n = this.fft.length;
     const avg = (a, b) => {
@@ -404,32 +473,29 @@ export class TrackPlayer {
     return { bass: avg(0, 0.05), mid: avg(0.05, 0.25), high: avg(0.3, 0.8) };
   }
 
+  /** normalized 0..1 band levels relative to THIS track's dynamics (for curl/glow) */
+  energy() {
+    return { ...this._norm };
+  }
+
   /** call once per frame; returns fluid events detected from the live spectrum */
   detect() {
     if (!this.playing) return [];
-    const e = this.energy();
     const now = this.ctx.currentTime;
+    const dt = Math.min(0.1, Math.max(0.001, now - this._lastT));
+    this._lastT = now;
+
+    const e = this._rawEnergy();
     const ev = [];
-
-    const mean = (arr) => arr.reduce((a, b) => a + b, 0) / (arr.length || 1);
+    const fired = {};
     for (const band of ['bass', 'mid', 'high']) {
-      this._hist[band].push(e[band]);
-      if (this._hist[band].length > 45) this._hist[band].shift();
+      fired[band] = this.bands[band].update(e[band], now, dt);
+      this._norm[band] = this.bands[band].norm;
     }
-    const warm = this._hist.bass.length > 12;
 
-    if (warm && e.bass > mean(this._hist.bass) * 1.32 && e.bass > 0.25 && now - this._last.kick > 0.22) {
-      this._last.kick = now;
-      ev.push({ type: 'kick', data: {} });
-    }
-    if (warm && e.high > mean(this._hist.high) * 1.45 && e.high > 0.1 && now - this._last.snare > 0.16) {
-      this._last.snare = now;
-      ev.push({ type: 'snare', data: { vel: Math.min(1, e.high * 2.2) } });
-    }
-    if (warm && e.mid > mean(this._hist.mid) * 1.28 && e.mid > 0.14 && now - this._last.note > 0.13) {
-      this._last.note = now;
-      ev.push({ type: 'note', data: { freq: this._dominantFreq(), vel: Math.min(1, e.mid * 1.8) } });
-    }
+    if (fired.bass) ev.push({ type: 'kick', data: {} });
+    if (fired.high) ev.push({ type: 'snare', data: { vel: 0.4 + 0.6 * this.bands.high.norm } });
+    if (fired.mid) ev.push({ type: 'note', data: { freq: this._dominantFreq(), vel: 0.4 + 0.6 * this.bands.mid.norm } });
     return ev;
   }
 
