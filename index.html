@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Beethoven Fluid Remix — Symphony No. 5</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <div id="overlay">
+    <div class="title">
+      <h1>BEETHOVEN</h1>
+      <p class="sub">Symphony No.&thinsp;5 &middot; Fluid Remix &middot; 126 BPM</p>
+      <p class="hint">全部声音由 Web Audio API 实时合成 &middot; 流体在 GPU 上求解 Navier&ndash;Stokes</p>
+    </div>
+  </div>
+
+  <div id="hud">
+    <button id="play" title="空格键也可以">▶</button>
+    <span id="section"></span>
+  </div>
+
+  <p id="foot">拖动画面可以搅动流体</p>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
