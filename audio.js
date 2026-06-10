@@ -341,3 +341,105 @@ export class AudioEngine {
     return due;
   }
 }
+
+/* Plays a user-uploaded audio file and extracts beat/melody events
+   in real time (spectral-flux onset detection), so the fluid can dance to any song. */
+export class TrackPlayer {
+  constructor() {
+    this.playing = false;
+    this.name = '';
+    this.offset = 0;
+    this._hist = { bass: [], mid: [], high: [] };
+    this._last = { kick: 0, snare: 0, note: 0 };
+  }
+
+  _build() {
+    const ctx = (this.ctx = new (window.AudioContext || window.webkitAudioContext)());
+    this.master = ctx.createGain();
+    this.master.gain.value = 0.9;
+    this.analyser = ctx.createAnalyser();
+    this.analyser.fftSize = 1024;
+    this.analyser.smoothingTimeConstant = 0.6;
+    this.fft = new Uint8Array(this.analyser.frequencyBinCount);
+    this.master.connect(this.analyser).connect(ctx.destination);
+  }
+
+  async load(file) {
+    if (!this.ctx) this._build();
+    if (this.ctx.state === 'suspended') await this.ctx.resume();
+    const data = await file.arrayBuffer();
+    this.buffer = await this.ctx.decodeAudioData(data);
+    this.name = file.name.replace(/\.[^.]+$/, '');
+    this.offset = 0;
+  }
+
+  async start() {
+    if (!this.buffer) return;
+    if (this.ctx.state === 'suspended') await this.ctx.resume();
+    this.src = this.ctx.createBufferSource();
+    this.src.buffer = this.buffer;
+    this.src.loop = true;
+    this.src.connect(this.master);
+    this.startedAt = this.ctx.currentTime;
+    this.src.start(0, this.offset % this.buffer.duration);
+    this.playing = true;
+  }
+
+  pause() {
+    if (!this.playing) return;
+    this.offset = (this.offset + this.ctx.currentTime - this.startedAt) % this.buffer.duration;
+    try { this.src.stop(); } catch (_) {}
+    this.playing = false;
+  }
+
+  energy() {
+    if (!this.analyser) return { bass: 0, mid: 0, high: 0 };
+    this.analyser.getByteFrequencyData(this.fft);
+    const n = this.fft.length;
+    const avg = (a, b) => {
+      let s = 0; const i0 = Math.floor(a * n), i1 = Math.max(i0 + 1, Math.floor(b * n));
+      for (let i = i0; i < i1; i++) s += this.fft[i];
+      return s / (i1 - i0) / 255;
+    };
+    return { bass: avg(0, 0.05), mid: avg(0.05, 0.25), high: avg(0.3, 0.8) };
+  }
+
+  /** call once per frame; returns fluid events detected from the live spectrum */
+  detect() {
+    if (!this.playing) return [];
+    const e = this.energy();
+    const now = this.ctx.currentTime;
+    const ev = [];
+
+    const mean = (arr) => arr.reduce((a, b) => a + b, 0) / (arr.length || 1);
+    for (const band of ['bass', 'mid', 'high']) {
+      this._hist[band].push(e[band]);
+      if (this._hist[band].length > 45) this._hist[band].shift();
+    }
+    const warm = this._hist.bass.length > 12;
+
+    if (warm && e.bass > mean(this._hist.bass) * 1.32 && e.bass > 0.25 && now - this._last.kick > 0.22) {
+      this._last.kick = now;
+      ev.push({ type: 'kick', data: {} });
+    }
+    if (warm && e.high > mean(this._hist.high) * 1.45 && e.high > 0.1 && now - this._last.snare > 0.16) {
+      this._last.snare = now;
+      ev.push({ type: 'snare', data: { vel: Math.min(1, e.high * 2.2) } });
+    }
+    if (warm && e.mid > mean(this._hist.mid) * 1.28 && e.mid > 0.14 && now - this._last.note > 0.13) {
+      this._last.note = now;
+      ev.push({ type: 'note', data: { freq: this._dominantFreq(), vel: Math.min(1, e.mid * 1.8) } });
+    }
+    return ev;
+  }
+
+  /** strongest spectral peak between ~150 Hz and ~2.5 kHz */
+  _dominantFreq() {
+    const binHz = this.ctx.sampleRate / this.analyser.fftSize;
+    const i0 = Math.max(1, Math.round(150 / binHz));
+    const i1 = Math.min(this.fft.length - 1, Math.round(2500 / binHz));
+    let best = i0;
+    for (let i = i0; i <= i1; i++) if (this.fft[i] > this.fft[best]) best = i;
+    return best * binHz;
+  }
+}

@@ -82,6 +82,27 @@ html, body {
 }
 #play:active { transform: scale(0.96); }
 
+#upload, #back {
+  height: 44px;
+  border-radius: 22px;
+  border: 1px solid rgba(232, 220, 200, 0.35);
+  background: rgba(15, 12, 18, 0.45);
+  color: #e8dcc8;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  font-size: 0.95rem;
+  padding: 0 1rem;
+  transition: transform 0.15s ease, border-color 0.3s, box-shadow 0.3s;
+}
+#upload { width: 44px; padding: 0; border-radius: 50%; }
+#upload:hover, #back:hover {
+  transform: scale(1.06);
+  border-color: #e7c178;
+  box-shadow: 0 0 18px rgba(231, 193, 120, 0.3);
+}
+#back { font-size: 0.78rem; letter-spacing: 0.08em; }
+#back.hidden { display: none; }
+
 #section {
   font-size: 0.8rem;
   letter-spacing: 0.4em;

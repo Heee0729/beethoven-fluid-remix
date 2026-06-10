@@ -1,13 +1,18 @@
-import { AudioEngine } from './audio.js';
+import { AudioEngine, TrackPlayer } from './audio.js';
 import { Fluid } from './fluid.js';
 
 const canvas = document.getElementById('c');
 const playBtn = document.getElementById('play');
 const overlay = document.getElementById('overlay');
 const sectionEl = document.getElementById('section');
+const uploadBtn = document.getElementById('upload');
+const fileInput = document.getElementById('file');
+const backBtn = document.getElementById('back');
 
 const fluid = new Fluid(canvas);
 const audio = new AudioEngine();
+const track = new TrackPlayer();
+let source = audio; // current sound source: synth remix or uploaded song
 
 // ---- palettes per section (base hue, hue spread) ----
 const PALETTES = {
@@ -18,6 +23,7 @@ const PALETTES = {
   'CODA':       { hue: 0.11, spread: 0.05 },  // gold
 };
 let palette = PALETTES['FATE MOTIF'];
+const USER_PALETTE = { hue: 0.6, spread: 0.12 }; // hue drifts while a song plays
 
 function hsv(h, s, v) {
   h = ((h % 1) + 1) % 1;
@@ -128,9 +134,15 @@ function frame(now) {
   const dt = Math.min((now - last) / 1000, 1 / 30);
   last = now;
 
-  if (audio.playing) {
-    for (const ev of audio.dueEvents()) onEvent(ev);
-    const { bass, mid, high } = audio.energy();
+  if (source.playing) {
+    if (source === track) {
+      USER_PALETTE.hue = (USER_PALETTE.hue + dt * 0.012) % 1;
+      palette = USER_PALETTE;
+      for (const ev of track.detect()) onEvent(ev);
+    } else {
+      for (const ev of audio.dueEvents()) onEvent(ev);
+    }
+    const { bass, mid, high } = source.energy();
     // low end drives swirliness, highs drive sparkle dissipation
     fluid.params.curl = 16 + bass * 38;
     fluid.params.dyeDissipation = 0.982 + high * 0.012;
@@ -147,19 +159,55 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // ---- transport ----
-let started = false;
 playBtn.addEventListener('click', async () => {
-  if (!started || !audio.playing) {
-    await audio.start();
-    started = true;
+  if (!source.playing) {
+    await source.start();
     overlay.classList.add('hidden');
     playBtn.textContent = '❚❚';
   } else {
-    audio.pause();
+    source.pause();
     overlay.classList.remove('hidden');
     playBtn.textContent = '▶';
   }
 });
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Space') { e.preventDefault(); playBtn.click(); }
+});
+
+// ---- user song upload ----
+async function useFile(file) {
+  if (!file || !file.type.startsWith('audio/')) return;
+  sectionEl.textContent = '解码中…';
+  try {
+    if (audio.playing) audio.pause();
+    if (track.playing) track.pause();
+    await track.load(file);
+  } catch (_) {
+    sectionEl.textContent = '无法解码这个文件';
+    return;
+  }
+  source = track;
+  await track.start();
+  overlay.classList.add('hidden');
+  playBtn.textContent = '❚❚';
+  sectionEl.textContent = '♪ ' + track.name;
+  backBtn.classList.remove('hidden');
+}
+
+uploadBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => { useFile(fileInput.files[0]); fileInput.value = ''; });
+
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  useFile(e.dataTransfer.files[0]);
+});
+
+backBtn.addEventListener('click', async () => {
+  if (track.playing) track.pause();
+  source = audio;
+  backBtn.classList.add('hidden');
+  await audio.start();
+  overlay.classList.add('hidden');
+  playBtn.textContent = '❚❚';
 });
